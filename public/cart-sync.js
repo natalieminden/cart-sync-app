@@ -61,7 +61,7 @@
     const res = await nativeFetch(...args);
     if (
       typeof url === "string" &&
-      /\\/cart\\/(add|update|change|clear)\\.js/.test(url)
+      /cart\/(add|update|change|clear)\.js/.test(url)
     ) {
       save();
     }
