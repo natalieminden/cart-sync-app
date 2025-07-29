@@ -1,10 +1,14 @@
-const crypto = require("crypto")
+const crypto = require("crypto");
 
-function verifyHMAC(query, secret) {
-  const { hmac, ...rest } = query
-  const message = Object.keys(rest).sort().map(k => `${k}=${rest[k]}`).join("&")
-  const digest = crypto.createHmac("sha256", secret).update(message).digest("hex")
-  return crypto.timingSafeEqual(Buffer.from(hmac, 'utf-8'), Buffer.from(digest, 'utf-8'))
-}
+exports.verifyHMAC = (query, secret) => {
+  const sig = query.hmac || query.signature;
+  if (!sig) return false;
+  const { hmac, signature, ...rest } = query;
+  const msg = Object.keys(rest)
+    .sort()
+    .map(k => `${k}=${rest[k]}`)
+    .join("&");
 
-module.exports = { verifyHMAC }
+  const digest = crypto.createHmac("sha256", secret).update(msg).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig, "utf8"), Buffer.from(digest, "utf8"));
+};
