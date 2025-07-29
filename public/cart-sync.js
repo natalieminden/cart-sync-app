@@ -125,8 +125,22 @@
     };
   }
 
-  document.addEventListener('DOMContentLoaded', () => {
-    restoreCart();
-    patchFetchForCart();
+    /* Restores on load. */
+  document.addEventListener("DOMContentLoaded", async () => {
+    try {
+      const data = await j(`/apps/cart-sync/restore?shop=${shop}&customer_id=${cid}`);
+      console.log("cart‑sync restore:", data);           // <‑‑ add log
+      if (!Array.isArray(data.cart) || !data.cart.length) return;
+
+      await fetch("/cart/clear.js", { method: "POST" });
+      for (const l of data.cart) {
+        await fetch("/cart/add.js", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: l.id, quantity: l.quantity })
+        });
+      }
+    } catch (e) { console.warn("restore fail", e); }
   });
+
 })();

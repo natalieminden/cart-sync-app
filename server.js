@@ -64,8 +64,15 @@ const restoreHandler = async (req, res) => {
   const url =
     `https://${shop}/admin/api/2023-04/customers/${customer_id}` +
     `/metafields.json?namespace=custom&key=cart_data`;
+
   const json = await fetch(url, { headers: { "X-Shopify-Access-Token": token } }).then(r => r.json());
-  res.json({ cart: json.metafields?.[0]?.value || [] });
+
+  let cart = [];
+  try {
+    cart = JSON.parse(json.metafields?.[0]?.value || "[]");
+  } catch (_) {
+  }
+  res.json({ cart });
 };
 
 app.get ("/app_proxy/cart/restore", restoreHandler);
