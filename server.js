@@ -68,7 +68,7 @@ app.post("/app_proxy/cart/restore", async (req, res) => {
   const token = getToken(shop)
   if (!token) return res.status(403).send("Unknown shop")
 
-  const response = await fetch(`https://${shop}/admin/api/2023-04/customers/${customer_id}/metafields.json?namespace=cart&key=data`, {
+  const response = await fetch(`https://${shop}/admin/api/2023-04/customers/${customer_id}/metafields.json?namespace=custom&key=cart_data`, {
     headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
   })
   const data = await response.json()
@@ -86,7 +86,7 @@ app.post("/app_proxy/cart/save", async (req, res) => {
   const metafield = {
     metafield: {
       namespace: "cart",
-      key: "data",
+      key: "cart_data",
       type: "json",
       value: JSON.stringify(req.body.cart),
       owner_id: customer_id,
