@@ -1,108 +1,101 @@
-const express = require("express")
-const bodyParser = require("body-parser")
-const fs = require("fs")
-const path = require("path")
-const fetch = global.fetch || require("node-fetch")
-const dotenv = require("dotenv")
-const { verifyHMAC } = require("./utils/hmac")
+const express = require("express");
+const bodyParser = require("body-parser");
+const fs = require("fs");
+const path = require("path");
+const fetch = global.fetch || require("node-fetch");
+const dotenv = require("dotenv");
+const { verifyHMAC } = require("./utils/hmac");
 
-dotenv.config()
+dotenv.config();
 
-const app = express()
-app.use(bodyParser.json())
-app.use(express.urlencoded({ extended: true }))
-app.use(express.static("public"))
+const app = express();
+app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 3000
-const HOST = process.env.HOST
-const API_KEY = process.env.SHOPIFY_API_KEY
-const API_SECRET = process.env.SHOPIFY_API_SECRET
-const SCOPES = process.env.SCOPES
-const TOKEN_STORE = path.join(__dirname, "storage", "tokens.json")
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST;                       // https://cart-sync-app.onrender.com
+const API_KEY = process.env.SHOPIFY_API_KEY;
+const API_SECRET = process.env.SHOPIFY_API_SECRET;
+const SCOPES = process.env.SCOPES;                   // read_customers,write_customers
+const TOKEN_STORE = path.join(__dirname, "storage", "tokens.json");
 
-function getToken(shop) {
-  if (!fs.existsSync(TOKEN_STORE)) return null
-  const tokens = JSON.parse(fs.readFileSync(TOKEN_STORE))
-  return tokens[shop]
-}
+/* ---------- token helpers ---------- */
+const getToken = shop => {
+  if (!fs.existsSync(TOKEN_STORE)) return null;
+  return JSON.parse(fs.readFileSync(TOKEN_STORE))[shop];
+};
+const saveToken = (shop, token) => {
+  const t = fs.existsSync(TOKEN_STORE) ? JSON.parse(fs.readFileSync(TOKEN_STORE)) : {};
+  t[shop] = token;
+  fs.writeFileSync(TOKEN_STORE, JSON.stringify(t, null, 2));
+};
 
-function saveToken(shop, token) {
-  const tokens = fs.existsSync(TOKEN_STORE) ? JSON.parse(fs.readFileSync(TOKEN_STORE)) : {}
-  tokens[shop] = token
-  fs.writeFileSync(TOKEN_STORE, JSON.stringify(tokens, null, 2))
-}
-
-// install endpoint
+/* ---------- OAuth handshake ---------- */
 app.get("/auth", (req, res) => {
-  const shop = req.query.shop
-  if (!shop) return res.status(400).send("Missing shop param")
-  const redirectUri = `${HOST}/auth/callback`
-  const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${API_KEY}&scope=${SCOPES}&redirect_uri=${redirectUri}`
-  res.redirect(installUrl)
-})
+  const { shop } = req.query;
+  if (!shop) return res.status(400).send("no shop");
+  const redirectUri = `${HOST}/auth/callback`;
+  const url =
+    `https://${shop}/admin/oauth/authorize?client_id=${API_KEY}` +
+    `&scope=${SCOPES}&redirect_uri=${redirectUri}`;
+  res.redirect(url);
+});
 
-// oauth callback
 app.get("/auth/callback", async (req, res) => {
-  const { shop, code, hmac } = req.query
-  if (!verifyHMAC(req.query, API_SECRET)) return res.status(400).send("HMAC failed")
+  const { shop, code } = req.query;
+  if (!verifyHMAC(req.query, API_SECRET)) return res.status(400).send("bad hmac");
 
-  const result = await fetch(`https://${shop}/admin/oauth/access_token`, {
+  const r = await fetch(`https://${shop}/admin/oauth/access_token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: API_KEY,
-      client_secret: API_SECRET,
-      code
-    })
-  })
+    body: JSON.stringify({ client_id: API_KEY, client_secret: API_SECRET, code })
+  }).then(r => r.json());
 
-  const json = await result.json()
-  saveToken(shop, json.access_token)
-  res.send("✅ App installed! You can now sync carts.")
-})
+  saveToken(shop, r.access_token);
+  res.send("✅ app installed");
+});
 
-// app proxy restore endpoint
-app.post("/app_proxy/cart/restore", async (req, res) => {
-  const { shop, customer_id } = req.query
-  if (!verifyHMAC(req.query, API_SECRET)) return res.status(403).send("Invalid HMAC")
-  const token = getToken(shop)
-  if (!token) return res.status(403).send("Unknown shop")
+/* ---------- restore & save ---------- */
+const restoreHandler = async (req, res) => {
+  const { shop, customer_id } = req.query;
+  if (!verifyHMAC(req.query, API_SECRET)) return res.status(403).send("bad hmac");
+  const token = getToken(shop);
+  if (!token) return res.status(403).send("unknown shop");
 
-  const response = await fetch(`https://${shop}/admin/api/2023-04/customers/${customer_id}/metafields.json?namespace=custom&key=cart_data`, {
-    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
-  })
-  const data = await response.json()
-  const value = data.metafields?.[0]?.value || null
-  res.json({ cart: value })
-})
+  const url =
+    `https://${shop}/admin/api/2023-04/customers/${customer_id}` +
+    `/metafields.json?namespace=custom&key=cart_data`;
+  const json = await fetch(url, { headers: { "X-Shopify-Access-Token": token } }).then(r => r.json());
+  res.json({ cart: json.metafields?.[0]?.value || [] });
+};
 
-// app proxy save endpoint
+app.get ("/app_proxy/cart/restore", restoreHandler);
+app.post("/app_proxy/cart/restore", restoreHandler);
+
 app.post("/app_proxy/cart/save", async (req, res) => {
-  const { shop, customer_id } = req.query
-  if (!verifyHMAC(req.query, API_SECRET)) return res.status(403).send("Invalid HMAC")
-  const token = getToken(shop)
-  if (!token) return res.status(403).send("Unknown shop")
+  const { shop, customer_id } = req.query;
+  if (!verifyHMAC(req.query, API_SECRET)) return res.status(403).send("bad hmac");
+  const token = getToken(shop);
+  if (!token) return res.status(403).send("unknown shop");
 
-  const metafield = {
+  const body = {
     metafield: {
-      namespace: "cart",
+      namespace: "custom",
       key: "cart_data",
       type: "json",
-      value: JSON.stringify(req.body.cart),
       owner_id: customer_id,
-      owner_resource: "customer"
+      owner_resource: "customer",
+      value: JSON.stringify(req.body.cart || [])
     }
-  }
+  };
 
   await fetch(`https://${shop}/admin/api/2023-04/metafields.json`, {
     method: "POST",
     headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
-    body: JSON.stringify(metafield)
-  })
+    body: JSON.stringify(body)
+  });
 
-  res.sendStatus(204)
-})
+  res.sendStatus(204);
+});
 
-app.listen(PORT, () => {
-  console.log(`server running on port ${PORT}`)
-})
+/* ---------- kick it ---------- */
+app.listen(PORT, () => console.log(`cart‑sync server on ${PORT}`));
