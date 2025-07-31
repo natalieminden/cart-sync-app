@@ -1,77 +1,110 @@
-const express = require("express");
-const body = require("body-parser");
-const fs = require("fs");
-const path = require("path");
-const fetch = global.fetch || require("node-fetch");
-const dotenv = require("dotenv");
-const { verifyHMAC } = require("./utils/hmac");
-
-dotenv.config();
-const { PORT=3000, HOST, SHOPIFY_API_KEY, SHOPIFY_API_SECRET, SCOPES } = process.env;
-const TOKENS = path.join(__dirname, "storage", "tokens.json");
-
+// Load environment variables
+require('dotenv').config();
+const express = require('express');
+const crypto = require('crypto');
+const fetch = require('node-fetch');  // Use node-fetch for Admin API calls
 const app = express();
-app.use(body.json());
-app.use(express.static("public"));          // serves /cart-sync.js
+app.use(express.json());
 
-/* ------------ helpers ------------ */
-const getToken = s => fs.existsSync(TOKENS)?JSON.parse(fs.readFileSync(TOKENS))[s]:null;
-const saveToken = (s,t)=>{
-  const j = fs.existsSync(TOKENS)?JSON.parse(fs.readFileSync(TOKENS)):{};
-  j[s]=t; fs.mkdirSync("storage",{recursive:true});
-  fs.writeFileSync(TOKENS, JSON.stringify(j,null,2));
-};
+// Config from .env
+const { SHOP, SHOPIFY_API_SECRET, SHOPIFY_ADMIN_TOKEN } = process.env;
 
-/* ------------ OAuth ------------ */
-app.get("/auth",(req,res)=>{
-  const { shop } = req.query;
-  const redirect = `${HOST}/auth/callback`;
-  res.redirect(`https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_API_KEY}&scope=${SCOPES}&redirect_uri=${redirect}`);
+// Middleware to verify HMAC on all proxy requests
+function verifyProxy(req, res, next) {
+  const query = { ...req.query };
+  const signature = query.signature;
+  if (!signature) return res.status(401).send('Missing signature');
+  delete query.signature;
+  // Create message by sorting query params alphabetically and concatenating "key=value"
+  const message = Object.keys(query).sort().map(key => `${key}=${query[key]}`).join('');
+  const hmac = crypto.createHmac('sha256', SHOPIFY_API_SECRET).update(message).digest('hex');
+  if (hmac !== signature) {
+    console.error('Proxy HMAC validation failed');
+    return res.status(401).send('Invalid signature');  // Reject if signature doesn’t match
+  }
+  return next();
+}
+
+// Apply HMAC verification to all routes under /proxy
+app.use('/proxy', verifyProxy);
+
+// POST /proxy/save - Save the current cart (items) to the customer metafield
+app.post('/proxy/save', async (req, res) => {
+  const customerId = req.query.logged_in_customer_id;
+  if (!customerId) {
+    return res.status(401).json({ error: 'Not logged in' });
+  }
+  const { items } = req.body;
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: 'No items provided' });
+  }
+  try {
+    // Prepare metafield payload
+    const metafield = {
+      namespace: 'custom',
+      key: 'cart_data',
+      type: 'json',
+      value: JSON.stringify({ items })  // store { items: [ ... ] }
+    };
+    // Check if metafield exists for this customer
+    const getUrl = `https://${SHOP}/admin/api/2023-04/customers/${customerId}/metafields.json?namespace=${metafield.namespace}&key=${metafield.key}`;
+    const apiHeaders = { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' };
+    const getResp = await fetch(getUrl, { method: 'GET', headers: apiHeaders });
+    const getData = await getResp.json();
+    if (getData.metafields && getData.metafields.length) {
+      // Update existing metafield
+      const existingId = getData.metafields[0].id;
+      const updateUrl = `https://${SHOP}/admin/api/2023-04/metafields/${existingId}.json`;
+      await fetch(updateUrl, { method: 'PUT', headers: apiHeaders, body: JSON.stringify({ metafield }) });
+    } else {
+      // Create new metafield for this customer
+      metafield.owner_id = customerId;
+      metafield.owner_resource = 'customer';
+      const createUrl = `https://${SHOP}/admin/api/2023-04/metafields.json`;
+      await fetch(createUrl, { method: 'POST', headers: apiHeaders, body: JSON.stringify({ metafield }) });
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Error saving cart metafield:', error);
+    // Do NOT fail the store experience; just report an error status
+    return res.status(500).json({ success: false, error: 'Server error saving cart' });
+  }
 });
-app.get("/auth/callback", async (req,res)=>{
-  if(!verifyHMAC(req.query, SHOPIFY_API_SECRET)) return res.status(400).send("bad hmac");
-  const { shop, code } = req.query;
-  const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`,{
-    method:"POST", headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({ client_id:SHOPIFY_API_KEY, client_secret:SHOPIFY_API_SECRET, code })
-  }).then(r=>r.json());
-  saveToken(shop, tokenResp.access_token);
-  res.send("✅ installed");
+
+// GET /proxy/restore - Retrieve saved cart from metafield
+app.get('/proxy/restore', async (req, res) => {
+  const customerId = req.query.logged_in_customer_id;
+  if (!customerId) {
+    return res.status(401).json({ error: 'Not logged in' });
+  }
+  try {
+    const url = `https://${SHOP}/admin/api/2023-04/customers/${customerId}/metafields.json?namespace=custom&key=cart_data`;
+    const resp = await fetch(url, { headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN } });
+    const data = await resp.json();
+    if (!data.metafields || data.metafields.length === 0) {
+      return res.json({ items: [] });  // No saved cart found
+    }
+    const metafield = data.metafields[0];
+    // Parse metafield value (JSON string) to object
+    let savedItems = [];
+    try {
+      const parsed = JSON.parse(metafield.value);
+      savedItems = parsed.items || [];
+    } catch (e) {
+      console.error('Could not parse saved cart JSON:', e);
+    }
+    return res.json({ items: savedItems });
+  } catch (error) {
+    console.error('Error retrieving cart metafield:', error);
+    return res.status(500).json({ error: 'Server error restoring cart' });
+  }
 });
 
-/* ------------ restore ------------ */
-const restore = async (req,res)=>{
-  if(!verifyHMAC(req.query, SHOPIFY_API_SECRET)) return res.status(403).send("bad hmac");
-  const { shop, customer_id } = req.query;
-  const token = getToken(shop); if(!token) return res.status(403).send("no token");
+// root endpoint to verify app is running
+app.get('/', (req, res) => res.send('Cart Sync App Running'));
 
-  const url = `https://${shop}/admin/api/2025-07/customers/${customer_id}/metafields.json?namespace=custom&key=cart_data`;
-  const json = await fetch(url, { headers:{ "X-Shopify-Access-Token":token } }).then(r=>r.json());
-  let cart=[];
-  try{ cart = JSON.parse(json.metafields?.[0]?.value || "[]"); }catch(_){}
-  res.json({ cart });
-};
-app.get ("/app_proxy/cart/restore", restore);
-app.post("/app_proxy/cart/restore", restore);
-
-/* ------------ save ------------ */
-app.post("/app_proxy/cart/save", async (req,res)=>{
-  if(!verifyHMAC(req.query, SHOPIFY_API_SECRET)) return res.status(403).send("bad hmac");
-  const { shop, customer_id } = req.query;
-  const token = getToken(shop); if(!token) return res.status(403).send("no token");
-
-  await fetch(`https://${shop}/admin/api/2025-07/metafields.json`,{
-    method:"POST",
-    headers:{ "X-Shopify-Access-Token":token, "Content-Type":"application/json" },
-    body: JSON.stringify({
-      metafield:{
-        namespace:"custom", key:"cart_data", type:"json",
-        owner_id:customer_id, owner_resource:"customer",
-        value: JSON.stringify(req.body.cart || [])
-      }
-    })
-  });
-  res.sendStatus(204);
+// Start the server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`App listening on port ${PORT}`);
 });
-
-app.listen(PORT,()=>console.log("cart‑sync running on",PORT));
